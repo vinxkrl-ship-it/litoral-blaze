@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { supabase } from '../lib/supabase'
 
 export function getColor(num) {
   if (num === 0) return 'white'
@@ -7,42 +8,40 @@ export function getColor(num) {
 }
 
 export default function useRounds() {
-  const [rounds,    setRounds]  = useState([])
-  const [online,    setOnline]  = useState(false)
-  const [error,     setError]   = useState(null)
-  const lastIdRef               = useRef(null)
-  const timerRef                = useRef(null)
-  const failCountRef            = useRef(0)
+  const [rounds,     setRounds]  = useState([])
+  const [online,     setOnline]  = useState(false)
+  const [error,      setError]   = useState(null)
+  const lastIdRef                = useRef(null)
+  const timerRef                 = useRef(null)
+  const failCountRef             = useRef(0)
 
   const fetchRounds = useCallback(async () => {
     try {
-      const res = await fetch('/api/rounds')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      if (!data.ok || !data.rounds?.length) throw new Error(data.error || 'Sem rodadas')
-
+      const { data, error: fnErr } = await supabase.functions.invoke('get-rounds')
+      if (fnErr) throw new Error(`Edge Function: ${fnErr.message}`)
+      if (!data) throw new Error('Resposta vazia')
+      if (!data.ok || !Array.isArray(data.rounds) || data.rounds.length === 0) {
+        failCountRef.current++
+        if (failCountRef.current >= 3) { setOnline(false); setError(data?.error || 'Sem rodadas') }
+        return
+      }
+      failCountRef.current = 0
+      setError(null)
       const newLastId = data.rounds[data.rounds.length - 1]?.id
       if (newLastId !== lastIdRef.current) {
         lastIdRef.current = newLastId
         setRounds(data.rounds)
       }
-
-      failCountRef.current = 0
       setOnline(true)
-      setError(null)
-
     } catch (err) {
       failCountRef.current++
-      if (failCountRef.current >= 3) {
-        setOnline(false)
-        setError(err?.message || 'Erro')
-      }
+      if (failCountRef.current >= 3) { setOnline(false); setError(err?.message || 'Erro') }
     }
   }, [])
 
   useEffect(() => {
     fetchRounds()
-    timerRef.current = setInterval(fetchRounds, 15000)
+    timerRef.current = setInterval(fetchRounds, 30000)
     return () => clearInterval(timerRef.current)
   }, [fetchRounds])
 
