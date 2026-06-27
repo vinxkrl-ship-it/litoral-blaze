@@ -16,44 +16,15 @@ export default function useRounds() {
 
   const fetchRounds = useCallback(async () => {
     try {
-      const res = await fetch(
-        'https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/100',
-        {
-          headers: {
-            'Accept': 'application/json',
-            'Accept-Language': 'pt-BR,pt;q=0.9',
-          },
-          credentials: 'include',
-        }
-      )
-
+      const res = await fetch('/api/rounds')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-
       const data = await res.json()
-      const records = Array.isArray(data) ? data : (data.records || data.data || [])
+      if (!data.ok || !data.rounds?.length) throw new Error(data.error || 'Sem rodadas')
 
-      if (!records.length) throw new Error('Sem rodadas')
-
-      const rounds = records.map((r) => {
-        const date = new Date(r.created_at)
-        const brt = new Date(date.getTime() - 3 * 60 * 60 * 1000)
-        const h = String(brt.getUTCHours()).padStart(2, '0')
-        const m = String(brt.getUTCMinutes()).padStart(2, '0')
-        const s = String(brt.getUTCSeconds()).padStart(2, '0')
-        return {
-          id: String(r.id),
-          num: r.roll,
-          color: r.color || getColor(r.roll),
-          time: r.created_at,
-          display: `${h}:${m}`,
-          displayFull: `${h}:${m}:${s}`,
-        }
-      }).reverse()
-
-      const newLastId = rounds[rounds.length - 1]?.id
+      const newLastId = data.rounds[data.rounds.length - 1]?.id
       if (newLastId !== lastIdRef.current) {
         lastIdRef.current = newLastId
-        setRounds(rounds)
+        setRounds(data.rounds)
       }
 
       failCountRef.current = 0
@@ -64,7 +35,7 @@ export default function useRounds() {
       failCountRef.current++
       if (failCountRef.current >= 3) {
         setOnline(false)
-        setError(err?.message || 'Erro ao buscar rodadas')
+        setError(err?.message || 'Erro')
       }
     }
   }, [])
