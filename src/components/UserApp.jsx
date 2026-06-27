@@ -55,15 +55,34 @@ export default function UserApp({ profile, rounds, online, signals, onLogout, on
     })
   }, [rounds])
 
-  // ✅ CORREÇÃO 2: IA com limite de 2 sinais simultâneos
+ // IA com bloqueio de janela: só 1 sinal por vez, pausa durante janela ativa
   useEffect(() => {
     if (!aiEnabled || !rounds.length) return
+
+    const now = new Date()
+
+    // Verificar se algum sinal ativo ainda está dentro da janela ±1min
     const ativos = signals.filter(s => s.status === 'active' || s.status === 'pending')
-    if (ativos.length >= 2) return  // LIMITE: máx 2 sinais ao mesmo tempo
+    const dentroDaJanela = ativos.some(s => {
+      const { startW, endW } = getSigWindow(s.time_str)
+      // Janela extendida: bloquear desde o momento do sinal até 1 min depois
+      const bloqueioInicio = new Date(startW.getTime() - 60000) // 2 min antes do horário
+      return now >= bloqueioInicio && now <= endW
+    })
+
+    // Se tem sinal na janela, IA para de analisar
+    if (dentroDaJanela) return
+
+    // Fora da janela, pode analisar
     const r = analyze(rounds, signals, aiEnabled)
     if (!r.shouldSend) return
-    const dup = signals.find(s => (s.status === 'active' || s.status === 'pending') && s.time_str === r.time)
+
+    // Verificar duplicata exata
+    const dup = signals.find(s =>
+      (s.status === 'active' || s.status === 'pending') && s.time_str === r.time
+    )
     if (dup) return
+
     supabase.from('signals').insert({
       time_str: r.time,
       protection: 6,
