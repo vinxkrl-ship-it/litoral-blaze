@@ -1,0 +1,36 @@
+const CACHE = 'litoral-blaze-v1'
+
+self.addEventListener('install', e => {
+  self.skipWaiting()
+})
+
+self.addEventListener('activate', e => {
+  e.waitUntil(clients.claim())
+})
+
+// Recebe mensagem do app para disparar notificação push
+self.addEventListener('message', e => {
+  if (e.data?.type === 'SIGNAL_NOTIFY') {
+    const { time, confidence } = e.data
+    self.registration.showNotification('🔥 LITORAL BLAZE — SINAL!', {
+      body: `Branco previsto às ${time} | Confiança: ${confidence}%`,
+      icon: '/logo.png',
+      badge: '/logo.png',
+      tag: 'signal',          // substitui notificação anterior (não acumula)
+      renotify: true,
+      vibrate: [200, 100, 200, 100, 400],
+      requireInteraction: true,
+      data: { url: '/' },
+    })
+  }
+})
+
+self.addEventListener('notificationclick', e => {
+  e.notification.close()
+  e.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+      if (list.length) return list[0].focus()
+      return clients.openWindow('/')
+    })
+  )
+})

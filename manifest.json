@@ -1,0 +1,733 @@
+import { getColor } from '../hooks/useRounds'
+
+function toBRT(date) {
+  return new Date(new Date(date).getTime() - 3 * 60 * 60 * 1000)
+}
+function brtHour(date)   { return toBRT(date).getUTCHours() }
+function brtMinute(date) { return toBRT(date).getUTCMinutes() }
+function brtDateStr(date) {
+  const b = toBRT(date)
+  return `${b.getUTCFullYear()}-${String(b.getUTCMonth()+1).padStart(2,'0')}-${String(b.getUTCDate()).padStart(2,'0')}`
+}
+function todayBRT() { return brtDateStr(new Date()) }
+
+function getTodayRounds(rounds) {
+  const today = todayBRT()
+  return rounds.filter(r => brtDateStr(r.time) === today)
+}
+
+export function getWhiteAverage(rounds) {
+  const now    = new Date()
+  const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const recentWhites  = rounds.filter(r => { const t = new Date(r.time); return t >= cutoff && t <= now && r.color === 'white' })
+  const roundsRecent  = rounds.filter(r => new Date(r.time) >= cutoff)
+  const roundHourSet  = new Set()
+  roundsRecent.forEach(r => { const b = toBRT(new Date(r.time)); roundHourSet.add(`${brtDateStr(new Date(r.time))}-${b.getUTCHours()}`) })
+  const hoursWithData = Math.max(roundHourSet.size, 1)
+  const totalWhites   = recentWhites.length
+  return { avgPerHour: totalWhites / hoursWithData, totalWhites, hoursWithData }
+}
+
+export function getHotMinutes(rounds) {
+  const now    = new Date()
+  const cutoff = new Date(now.getTime() - 18 * 60 * 60 * 1000)
+  const minuteCounts = {}
+  rounds.forEach(r => {
+    const t = new Date(r.time)
+    if (t < cutoff || t > now || r.color !== 'white') return
+    const mn = brtMinute(r.time)
+    minuteCounts[mn] = (minuteCounts[mn] || 0) + 1
+  })
+  if (!Object.keys(minuteCounts).length) return { hot: [], cold: [], minuteCounts: {}, hasData: false }
+  const maxCount  = Math.max(...Object.values(minuteCounts))
+  const threshold = Math.max(2, Math.floor(maxCount * 0.25))
+  const hot  = Object.entries(minuteCounts).filter(([, c]) => c >= threshold).map(([mn, c]) => ({ min: parseInt(mn), count: c })).sort((a, b) => b.count - a.count)
+  const cold = []
+  for (let mn = 0; mn < 60; mn++) { if ((minuteCounts[mn] || 0) <= 1) cold.push(mn) }
+  return { hot, cold, minuteCounts, hasData: true }
+}
+
+export function getCadenceQuota(rounds, signals) {
+  const { avgPerHour } = getWhiteAverage(rounds)
+  const now            = new Date()
+  const currentHour    = toBRT(now).getUTCHours()
+  const signalsSentThisHour = signals.filter(s => s.is_ai && brtHour(s.created_at) === currentHour).length
+  const signalQuota    = Math.max(1, Math.ceil(avgPerHour / 2))
+  return { avgPerHour: Math.round(avgPerHour * 10) / 10, signalQuota, signalsSentThisHour, blocked: signalsSentThisHour >= signalQuota, currentHour }
+}
+
+// ── P1: Top 5 números gatilho — após sair um número, em ~X minutos sai branco
+// Margem de detecção: ±1 min (conforme instrução original)
+// Novo: também calcula variação máxima entre ocorrências para o P2
+const P1_MIN_OCCURRENCES = 5
+function pillar1(allRounds) {
+  const byNum = {}
+  for (let i = 0; i < allRounds.length; i++) {
+    const num = allRounds[i].num
+    if (num === null || num === undefined) continue
+    for (let j = i + 1; j < allRounds.length; j++) {
+      if (allRounds[j].color === 'white') {
+        const mins = (new Date(allRounds[j].time) - new Date(allRounds[i].time)) / 60000
+        if (mins > 0 && mins <= 30) {
+          if (!byNum[num]) byNum[num] = []
+          byNum[num].push(Math.round(mins))
+        }
+        break
+      }
+    }
+  }
+  const candidates = []
+  for (const [numStr, intervals] of Object.entries(byNum)) {
+    if (intervals.length < P1_MIN_OCCURRENCES) continue
+    const freq = {}
+    intervals.forEach(v => { freq[v] = (freq[v] || 0) + 1 })
+    const modeEntry = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]
+    const mode = parseInt(modeEntry[0])
+    // Margem de ±1 min para detecção de gatilho (como estava)
+    const within = intervals.filter(x => Math.abs(x - mode) <= 1).length
+    const consistency = Math.round(within / intervals.length * 100)
+    // Variação máxima entre ocorrências (para P2 usar)
+    const maxVariation = Math.max(...intervals.map(x => Math.abs(x - mode)))
+    // Desvio padrão (medida de consistência do intervalo)
+    const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length
+    const stdDev = Math.sqrt(intervals.reduce((s, x) => s + (x - mean) ** 2, 0) / intervals.length)
+    candidates.push({
+      num: parseInt(numStr),
+      mode,
+      consistency,
+      occurrences: intervals.length,
+      intervals,
+      maxVariation,
+      stdDev: Math.round(stdDev * 10) / 10,
+      mean: Math.round(mean * 10) / 10,
+    })
+  }
+  candidates.sort((a, b) => b.consistency - a.consistency || b.occurrences - a.occurrences)
+  const top5 = candidates.slice(0, 5)
+  return { numbers: top5, valid: top5.length > 0, allCandidates: candidates }
+}
+
+// ── P2: Consistência do intervalo — variação máxima de ±2 min entre ocorrências
+// (não mais apenas "estar na metade forte do ranking")
+function pillar2(top5Numbers, triggerNum) {
+  if (!top5Numbers || !top5Numbers.length) return { valid: false, ranked: [], triggerEntry: null, bestNum: null, bestConsistency: 0, mode: 0, consistency: 0 }
+  const ranked = [...top5Numbers].sort((a, b) => b.consistency - a.consistency || b.occurrences - a.occurrences)
+
+  // Aceita qualquer um dos 3 primeiros do top5 como gatilho válido para o P2
+  const top3 = ranked.slice(0, 3)
+  const triggerEntry = top3.find(x => x.num === triggerNum) || null
+
+  // Intervalo consistente: ≥70% das ocorrências dentro de ±2 min da moda
+  const intervalConsistent = triggerEntry
+    ? triggerEntry.intervals.filter(x => Math.abs(x - triggerEntry.mode) <= 2).length / triggerEntry.intervals.length >= 0.70
+    : false
+  const valid = !!triggerEntry && intervalConsistent
+  return {
+    valid,
+    ranked,
+    top3,
+    triggerEntry,
+    bestNum: ranked[0]?.num ?? null,
+    bestConsistency: ranked[0]?.consistency ?? 0,
+    mode: triggerEntry?.mode ?? 0,
+    consistency: triggerEntry?.consistency ?? 0,
+    intervalConsistent,
+    variationOk: triggerEntry ? triggerEntry.maxVariation <= 4 : false,
+  }
+}
+
+// ── Estimativa inteligente ────────────────────────────────────────
+export function estimateNextWhite(top5triggers, lastNum, hotMap, nowMin) {
+  const profiles        = top5triggers || []
+  const currentProfile  = profiles.find(p => p.num === lastNum)
+  let estimateMin = null, estimateSource = 'fallback', corroboration = 0
+  if (currentProfile && currentProfile.mode > 0) {
+    estimateMin    = currentProfile.mode
+    estimateSource = `gatilho #${lastNum} (moda: ${currentProfile.mode}min, ${currentProfile.consistency}% consistencia)`
+    corroboration  = profiles.filter(p => p.num !== lastNum && Math.abs(p.mode - estimateMin) <= 1).length
+  }
+  if (estimateMin === null || estimateMin <= 0) {
+    if (hotMap.hasData && hotMap.hot.length > 0) {
+      const sorted = hotMap.hot.slice().sort((a, b) => { const da = (a.min - nowMin + 60) % 60; const db = (b.min - nowMin + 60) % 60; return da - db })
+      const next   = sorted[0]
+      estimateMin    = (next.min - nowMin + 60) % 60 || 5
+      estimateSource = `minuto quente ${String(next.min).padStart(2,'0')}min (fallback)`
+    } else {
+      estimateMin    = 5
+      estimateSource = 'padrao (sem dados suficientes)'
+    }
+  }
+  return { estimateMin: Math.max(1, Math.min(estimateMin, 20)), estimateSource, corroboration, profiles, currentProfile: currentProfile || null }
+}
+
+// ── P3: minuto alvo é quente (cadeia obrigatória P1+P2)
+// Margem de ±2 min para minutos quentes (como instruído)
+function pillar3(p1Active, p2Active, hotMap, targetMin, p5) {
+  if (!p1Active || !p2Active) return { valid: false, crossBonus: false }
+  const isHot      = hotMap.hot.some(x => Math.abs(x.min - targetMin) <= 2)
+  const crossBonus = isHot && p5.detected
+  return { valid: isHot, crossBonus }
+}
+
+// ── P4: ritmo preditivo de contexto ──────────────────────────────
+function pillar4(allRounds) {
+  const whites = allRounds.filter(r => r.color === 'white')
+  const regularContexts = []
+  for (let i = 2; i < whites.length; i++) {
+    const gaps   = [(new Date(whites[i-1].time) - new Date(whites[i-2].time)) / 60000, (new Date(whites[i].time) - new Date(whites[i-1].time)) / 60000]
+    const avgGap = (gaps[0] + gaps[1]) / 2
+    if (avgGap >= 7 && avgGap <= 15 && Math.abs(gaps[0] - gaps[1]) <= 3) {
+      const firstWhiteIdx = allRounds.indexOf(whites[i - 2])
+      if (firstWhiteIdx >= 10) {
+        const ctx = allRounds.slice(firstWhiteIdx - 10, firstWhiteIdx)
+        regularContexts.push({ context: ctx.map(r => ({ num: r.num, color: r.color })), avgGap: Math.round(avgGap) })
+      }
+    }
+  }
+  if (regularContexts.length === 0) return { detected: false, gap: 0 }
+  const currentCtx = allRounds.slice(-10).map(r => ({ num: r.num, color: r.color }))
+  if (currentCtx.length < 5) return { detected: false, gap: 0 }
+  let bestSimilarity = 0, bestGap = 0
+  for (const { context, avgGap } of regularContexts) {
+    const len = Math.min(context.length, currentCtx.length)
+    let score = 0
+    for (let i = 0; i < len; i++) {
+      if (context[i].color === currentCtx[i].color) score += 2
+      if (context[i].num   === currentCtx[i].num)   score += 1
+    }
+    const similarity = score / (len * 3)
+    if (similarity > bestSimilarity) { bestSimilarity = similarity; bestGap = avgGap }
+  }
+  return bestSimilarity >= 0.75 ? { detected: true, gap: bestGap, similarity: Math.round(bestSimilarity * 100) } : { detected: false, gap: 0 }
+}
+
+// ── P5: confirmação histórica no minuto alvo ──────────────────────
+function pillar5(allRounds, targetMin) {
+  let total = 0, confirmed = 0
+  for (let i = 1; i < allRounds.length; i++) {
+    if (allRounds[i].color !== 'white') continue
+    const mn = brtMinute(allRounds[i].time)
+    if (Math.abs(mn - targetMin) <= 2) { total++; const prev = allRounds[i-1]; if (prev.num === 4 || prev.num === 11 || prev.num === 0) confirmed++ }
+  }
+  const rate     = total >= 3 ? confirmed / total : 0
+  const detected = total >= 3 && rate >= 0.30
+  return { detected, boost: detected ? 15 : 0, rate: Math.round(rate * 100), total, confirmed }
+}
+
+// ── P6: sequência de 8 cores — AGORA PILAR OBRIGATÓRIO (não mais bônus) ──
+function pillar6(allRounds) {
+  const SEQ_LEN   = 8
+  const MATCH_MIN = 0.70
+  if (allRounds.length < SEQ_LEN + 1) return { detected: false, sequences: [] }
+  const seqList = []
+  for (let i = SEQ_LEN; i < allRounds.length; i++) {
+    if (allRounds[i].color !== 'white') continue
+    seqList.push(allRounds.slice(i - SEQ_LEN, i).map(r => r.color[0]).join(''))
+  }
+  if (seqList.length < 3) return { detected: false, sequences: [] }
+  const seqCount = {}
+  for (const s of seqList) seqCount[s] = (seqCount[s] || 0) + 1
+  const total    = seqList.length
+  const maxCount = Math.max(...Object.values(seqCount))
+  const topSeqs  = Object.entries(seqCount).filter(([, c]) => c >= Math.max(2, Math.floor(maxCount * 0.3))).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([seq, count]) => ({ seq, count, pct: Math.round(count / total * 100) }))
+  if (!topSeqs.length) return { detected: false, sequences: [] }
+  const currentSeq = allRounds.slice(-SEQ_LEN).map(r => r.color[0]).join('')
+  let bestMatch = null, bestScore = 0
+  for (const s of topSeqs) {
+    let matches = 0
+    for (let i = 0; i < SEQ_LEN; i++) { if (s.seq[i] === currentSeq[i]) matches++ }
+    const score = matches / SEQ_LEN
+    if (score > bestScore) { bestScore = score; bestMatch = { ...s, score } }
+  }
+  return bestScore >= MATCH_MIN
+    ? { detected: true, matchedSeq: bestMatch?.seq, matchPct: bestMatch?.pct || 0, matchScore: Math.round(bestScore * 100), currentSeq, sequences: topSeqs }
+    : { detected: false, currentSeq, sequences: topSeqs }
+}
+
+// ── P7: Detector de Falsos Brancos / Zonas Mortas ─────────────────────────────
+// Identifica padrões históricos onde o jogo "fingiu" que viria branco mas saiu 4 ou 11.
+// Analisa: sequência de cores, números recentes, intervalos, horários.
+// Veta o sinal se similaridade >= 90% com zona morta conhecida.
+function pillar7(allRounds) {
+  const FALSE_WHITE_NUMS = new Set([4, 11]) // números que saem no lugar do branco
+  const SEQ_LEN          = 8    // janela de contexto em rodadas
+  const MIN_OCCURRENCES  = 3    // mínimo de ocorrências para considerar padrão
+  const BLOCK_THRESHOLD  = 0.90 // 90% de similaridade para vetar
+
+  if (allRounds.length < SEQ_LEN + 5) return {
+    detected: false, blocking: false, patterns: [],
+    detail: 'Sem dados suficientes para análise de zonas mortas',
+    similarity: 0,
+  }
+
+  // 1. Coletar todos os "falsos brancos" históricos
+  // Um falso branco é: havia condição provável de branco (dentro de janela de minuto quente
+  // ou sequência compatível), mas saiu 4 ou 11 em vez de branco
+  const falseWhiteContexts = []
+  for (let i = SEQ_LEN; i < allRounds.length - 1; i++) {
+    const cur  = allRounds[i]
+    const next = allRounds[i + 1]
+    if (!FALSE_WHITE_NUMS.has(cur.num)) continue
+    // Verifica se o próximo branco "demorou" (ou seja, não saiu logo depois — era um ponto esperado mas não veio)
+    // Heurística: se o próximo branco veio entre 1 e 15 min depois desse 4 ou 11, era um ponto esperado
+    let nextWhiteIdx = -1
+    for (let j = i + 1; j < Math.min(i + 20, allRounds.length); j++) {
+      if (allRounds[j].color === 'white') { nextWhiteIdx = j; break }
+    }
+    const minsToWhite = nextWhiteIdx >= 0
+      ? (new Date(allRounds[nextWhiteIdx].time) - new Date(cur.time)) / 60000
+      : 999
+    // Só considera falso branco se o branco real veio entre 1–15 min (estava numa zona de espera)
+    if (minsToWhite < 1 || minsToWhite > 15) continue
+    const ctx = allRounds.slice(i - SEQ_LEN, i).map(r => ({
+      num:   r.num,
+      color: r.color[0], // 'w', 'r', 'b'
+    }))
+    const hourBRT = brtHour(cur.time)
+    const minBRT  = brtMinute(cur.time)
+    falseWhiteContexts.push({ ctx, falseNum: cur.num, hourBRT, minBRT, minsToWhite: Math.round(minsToWhite) })
+  }
+
+  if (falseWhiteContexts.length < MIN_OCCURRENCES) return {
+    detected: false, blocking: false, patterns: [],
+    detail: `Apenas ${falseWhiteContexts.length} falso(s) branco(s) registrado(s) — mínimo ${MIN_OCCURRENCES}`,
+    similarity: 0,
+    falseWhiteCount: falseWhiteContexts.length,
+  }
+
+  // 2. Agrupar contextos similares para encontrar padrões recorrentes
+  const patternGroups = []
+  const used = new Set()
+  for (let i = 0; i < falseWhiteContexts.length; i++) {
+    if (used.has(i)) continue
+    const group = [i]
+    for (let j = i + 1; j < falseWhiteContexts.length; j++) {
+      if (used.has(j)) continue
+      const sim = contextSimilarity(falseWhiteContexts[i].ctx, falseWhiteContexts[j].ctx)
+      if (sim >= 0.70) { group.push(j); used.add(j) }
+    }
+    used.add(i)
+    if (group.length >= MIN_OCCURRENCES) {
+      // Calcula o padrão representativo (mais comum dentro do grupo)
+      const repr = falseWhiteContexts[i]
+      patternGroups.push({
+        ctx:         repr.ctx,
+        count:       group.length,
+        falseNums:   group.map(idx => falseWhiteContexts[idx].falseNum),
+        hours:       group.map(idx => falseWhiteContexts[idx].hourBRT),
+        pct:         Math.round(group.length / falseWhiteContexts.length * 100),
+      })
+    }
+  }
+
+  if (patternGroups.length === 0) return {
+    detected: false, blocking: false, patterns: [],
+    detail: `${falseWhiteContexts.length} falsos brancos encontrados, mas sem padrão recorrente (mín. ${MIN_OCCURRENCES} similares)`,
+    similarity: 0,
+    falseWhiteCount: falseWhiteContexts.length,
+  }
+
+  // 3. Compara o contexto atual com os padrões de zona morta
+  const currentCtx = allRounds.slice(-SEQ_LEN).map(r => ({ num: r.num, color: r.color[0] }))
+  let maxSimilarity = 0
+  let matchedPattern = null
+  for (const pattern of patternGroups) {
+    const sim = contextSimilarity(pattern.ctx, currentCtx)
+    if (sim > maxSimilarity) { maxSimilarity = sim; matchedPattern = pattern }
+  }
+
+  const detected = maxSimilarity >= 0.70 // detectado (alerta amarelo)
+  const blocking = maxSimilarity >= BLOCK_THRESHOLD // bloqueia sinal (alerta vermelho)
+
+  // 4. Análise adicional: horário atual é horário de zona morta?
+  const nowHour = brtHour(new Date().toISOString())
+  const hourIsDeadZone = matchedPattern
+    ? matchedPattern.hours.filter(h => Math.abs(h - nowHour) <= 1).length / matchedPattern.hours.length >= 0.50
+    : false
+
+  // Se o horário NÃO é zona morta, reduz a severidade (não bloqueia, apenas detecta)
+  const effectiveBlocking = blocking && (hourIsDeadZone || maxSimilarity >= 0.95)
+
+  const topPattern = patternGroups.sort((a, b) => b.count - a.count)[0]
+
+  return {
+    detected,
+    blocking: effectiveBlocking,
+    patterns: patternGroups.slice(0, 3),
+    topPattern,
+    similarity: Math.round(maxSimilarity * 100),
+    matchedPattern,
+    falseWhiteCount: falseWhiteContexts.length,
+    detail: detected
+      ? `Zona morta detectada! Contexto atual tem ${Math.round(maxSimilarity * 100)}% de similaridade com padrão de falso branco (${matchedPattern?.count || 0}x histórico). ${effectiveBlocking ? 'SINAL BLOQUEADO.' : 'Atenção aumentada.'}`
+      : `Nenhuma zona morta ativa. ${falseWhiteContexts.length} falsos brancos mapeados em ${patternGroups.length} padrão(ões).`,
+    hourIsDeadZone,
+  }
+}
+
+// Calcula similaridade entre dois contextos de rodadas (0 a 1)
+function contextSimilarity(ctxA, ctxB) {
+  if (!ctxA || !ctxB || !ctxA.length || !ctxB.length) return 0
+  const len = Math.min(ctxA.length, ctxB.length)
+  let score = 0
+  for (let i = 0; i < len; i++) {
+    if (ctxA[i].color === ctxB[i].color) score += 2
+    if (ctxA[i].num   === ctxB[i].num)   score += 1
+  }
+  return score / (len * 3)
+}
+
+// ── CRUZAMENTOS ───────────────────────────────────────────────────
+function crossP1P6(currentProfile, p6, hotMap, nowMin) {
+  if (!currentProfile || !p6.detected) return { confirmed: false, bonus: 0 }
+  const estimatedMin = (nowMin + currentProfile.mode) % 60
+  const hotConfirms  = hotMap.hasData && hotMap.hot.some(x => Math.abs(x.min - estimatedMin) <= 2)
+  const confirmed    = hotConfirms
+  return { confirmed, bonus: confirmed ? 10 : 0 }
+}
+
+function crossP2P4(p2mode, p4) {
+  if (!p4.detected || !p2mode) return { converges: false, bonus: 0 }
+  const converges = Math.abs(p2mode - p4.gap) <= 2
+  return { converges, bonus: converges ? 12 : 0 }
+}
+
+function crossTop5Corroboration(corroboration) {
+  return corroboration >= 1
+}
+
+// ── Calcula estado de todos os pilares (para exibição visual) ─────
+export function computePillars(rounds, signals) {
+  const today = getTodayRounds(rounds)
+  if (today.length < 20) return { p1: false, p2: false, p3: false, p4: false, p5: false, p6: false, p7: false }
+  const nowMin     = toBRT(new Date()).getUTCMinutes()
+  const lastNum    = today.length ? today[today.length - 1].num : null
+  const p1         = pillar1(rounds)
+  const p4r        = pillar4(rounds)
+  const p6r        = pillar6(rounds)
+  const p7r        = pillar7(rounds)
+  const triggerHit = p1.valid ? p1.numbers.find(x => x.num === lastNum) : null
+  const p1Active   = p1.valid && !!triggerHit
+  const p2r        = pillar2(p1.numbers, lastNum)
+  const p2Active   = p2r.valid
+  const hotMap     = getHotMinutes(rounds)
+  const est        = estimateNextWhite(p1.numbers, lastNum, hotMap, nowMin)
+  const targetMin  = (nowMin + est.estimateMin) % 60
+  const p5r        = pillar5(rounds, targetMin)
+  const p3r        = pillar3(p1Active, p2Active, hotMap, targetMin, p5r)
+  // P7 "ativo" no painel significa que NÃO está bloqueando (zona segura)
+  return {
+    p1: p1Active,
+    p2: p2Active,
+    p3: p3r.valid,
+    p4: p4r.detected,
+    p5: p5r.detected,
+    p6: p6r.detected,
+    p7: !p7r.blocking, // acende quando está livre de zona morta
+  }
+}
+
+// ── LOG DETALHADO ─────────────────────────────────────────────────
+export function buildSignalLog(p1result, p2result, p3active, p4result, p5result, p6result, p7result, est, targetMin, lastNum) {
+  const lines = []
+  lines.push('=== MOTIVO DO SINAL ===')
+  lines.push('')
+
+  if (p1result.valid && p1result.numbers.find(x => x.num === lastNum)) {
+    const t = p1result.numbers.find(x => x.num === lastNum)
+    lines.push(`[P1] Gatilho #${lastNum} está no Top 5`)
+    lines.push(`     Moda: ${t.mode}min até o branco | Consistência: ${t.consistency}% em ${t.occurrences} ocorrências`)
+  } else {
+    lines.push(`[P1] #${lastNum} não é gatilho consistente`)
+  }
+  lines.push('')
+
+  if (p2result.valid) {
+    lines.push(`[P2] Intervalo consistente — variação ≤ 2min confirmada`)
+    lines.push(`     Moda: ${p2result.mode}min | Consistência: ${p2result.consistency}% | 70%+ das ocorrências dentro de ±2min`)
+  } else {
+    lines.push(`[P2] Intervalo irregular — variação acima de 2min`)
+    lines.push(`     Melhor do grupo: #${p2result.bestNum || '-'}(${p2result.bestConsistency || 0}%)`)
+  }
+  lines.push('')
+
+  if (p3active) {
+    lines.push(`[P3] Minuto alvo ${String(targetMin).padStart(2,'0')}min é QUENTE (±2min)`)
+    lines.push(`     Estimativa: branco esperado em ~${est.estimateMin} min`)
+  } else {
+    lines.push(`[P3] Minuto alvo ${String(targetMin).padStart(2,'0')}min não é minuto quente`)
+  }
+  lines.push('')
+
+  if (p4result.detected) {
+    lines.push(`[P4] Ritmo preditivo detectado`)
+    lines.push(`     Contexto atual tem ${p4result.similarity}% de similaridade com padrão histórico | Gap: ${p4result.gap}min`)
+  } else {
+    lines.push(`[P4] Nenhum padrão de ritmo preditivo detectado`)
+  }
+  lines.push('')
+
+  if (p5result.detected) {
+    lines.push(`[P5] Confirmação histórica no minuto alvo`)
+    lines.push(`     4/11/0 antes do branco em ${p5result.confirmed}/${p5result.total} casos (${p5result.rate}%) | +${p5result.boost}% confiança`)
+  } else {
+    lines.push(`[P5] Sem confirmação histórica (${p5result.confirmed || 0}/${p5result.total || 0})`)
+  }
+  lines.push('')
+
+  if (p6result.detected) {
+    lines.push(`[P6] Sequência de cores [${p6result.currentSeq}] bate ${p6result.matchScore}% com padrão [${p6result.matchedSeq}]`)
+    lines.push(`     Padrão precedeu brancos em ${p6result.matchPct}% das vezes`)
+  } else {
+    lines.push(`[P6] Sequência de cores sem padrão forte`)
+  }
+  lines.push('')
+
+  if (!p7result.blocking) {
+    lines.push(`[P7] ✅ Zona segura — sem padrão de falso branco ativo`)
+    lines.push(`     ${p7result.falseWhiteCount || 0} falsos brancos mapeados | Similaridade atual: ${p7result.similarity || 0}%`)
+  } else {
+    lines.push(`[P7] 🚫 ZONA MORTA DETECTADA — Sinal bloqueado pelo P7`)
+    lines.push(`     Similaridade ${p7result.similarity}% com padrão de falso branco (${p7result.matchedPattern?.count || 0}x no histórico)`)
+  }
+  lines.push('')
+
+  lines.push(`=== ESTIMATIVA ===`)
+  lines.push(`Fonte: ${est.estimateSource}`)
+  if (est.corroboration > 0) {
+    lines.push(`Corroboração: ${est.corroboration} outro(s) gatilho(s) do Top 5 apontam para o mesmo intervalo`)
+  }
+  lines.push(`Minuto alvo: :${String(targetMin).padStart(2,'0')}`)
+
+  return lines.join('\n')
+}
+
+export function analyze(rounds, signals, aiEnabled) {
+  const pillars = computePillars(rounds, signals)
+  if (!aiEnabled) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  const cadence = getCadenceQuota(rounds, signals)
+  if (cadence.blocked) return { shouldSend: false, reason: 'Analisando padrões...', pillars, cadenceBlocked: true, cadence }
+
+  const today = getTodayRounds(rounds)
+  if (today.length < 20) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  const hasActive = signals.some(s => s.status === 'active' || s.status === 'pending')
+  if (hasActive) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  const nowBRT  = toBRT(new Date())
+  const nowMin  = nowBRT.getUTCMinutes()
+  const p1      = pillar1(rounds)
+  const p4r     = pillar4(rounds)
+  if (!p1.valid) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  const lastNum    = today.length ? today[today.length - 1].num : null
+  const triggerHit = p1.numbers.find(x => x.num === lastNum)
+  const p1Active   = !!triggerHit
+  const p2r        = pillar2(p1.numbers, lastNum)
+  const p2Active   = p2r.valid
+
+  const hotMap      = getHotMinutes(rounds)
+  const est         = estimateNextWhite(p1.numbers, lastNum, hotMap, nowMin)
+  const estimateMin = est.estimateMin
+  const targetMin   = (nowMin + estimateMin) % 60
+
+  if (hotMap.hasData && hotMap.cold.includes(targetMin)) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  const p5r = pillar5(rounds, targetMin)
+  const p3r = pillar3(p1Active, p2Active, hotMap, targetMin, p5r)
+  const p6r = pillar6(rounds)
+  const p7r = pillar7(rounds)
+
+  // P7 veta o sinal se detectou zona morta com ≥90% de similaridade
+  if (p7r.blocking) return { shouldSend: false, reason: 'Zona morta detectada — aguardando...', pillars }
+
+  if (estimateMin < 5) return { shouldSend: false, reason: 'Analisando padrões...', pillars }
+
+  // ── Cruzamentos ─────────────────────────────────────────────────
+  const cx1  = crossP1P6(est.currentProfile, p6r, hotMap, nowMin)
+  const cx2  = crossP2P4(p2r.mode, p4r)
+  const cx3  = p3r.crossBonus
+  const cx4  = crossTop5Corroboration(est.corroboration)
+
+  // Pilares ativos (agora P6 conta como pilar obrigatório, P7 conta como veto)
+  const activePillars = {
+    p1: p1Active,
+    p2: p2Active,
+    p3: p3r.valid,
+    p4: p4r.detected,
+    p5: p5r.detected,
+    p6: p6r.detected,
+    p7: !p7r.blocking,
+  }
+
+  // Conta apenas P1–P6 (P7 é veto, não contador)
+  const count6 = [activePillars.p1, activePillars.p2, activePillars.p3, activePillars.p4, activePillars.p5, activePillars.p6].filter(Boolean).length
+
+  // Nova condição: 5 de 6 pilares (P1–P6) ativos
+  if (count6 < 5) return { shouldSend: false, reason: 'Analisando padrões...', pillars: activePillars }
+
+  // Calcula bônus de cruzamento
+  const crossBonus = (cx1.confirmed ? cx1.bonus : 0) + (cx2.converges ? cx2.bonus : 0) + (cx3 ? 8 : 0) + (cx4 ? 5 : 0)
+
+  const now       = new Date()
+  const target    = new Date(now.getTime() + estimateMin * 60000)
+  const targetBRT = toBRT(target)
+  const timeStr   = `${String(targetBRT.getUTCHours()).padStart(2,'0')}:${String(targetBRT.getUTCMinutes()).padStart(2,'0')}`
+
+  // P7 não bloqueando dá +5 de confiança (zona limpa confirmada)
+  const p7bonus    = !p7r.blocking && p7r.detected === false ? 5 : 0
+  const confidence = Math.min(55 + count6 * 5 + p5r.boost + (est.corroboration * 3) + crossBonus + p7bonus, 98)
+
+  const ai_log = buildSignalLog(p1, p2r, p3r.valid, p4r, p5r, p6r, p7r, est, targetMin, lastNum)
+
+  return {
+    shouldSend:     true,
+    time:           timeStr,
+    confidence,
+    pillars:        activePillars,
+    activeCount:    count6,
+    reason:         `SINAL: Branco ${timeStr}`,
+    trigger:        lastNum,
+    estimateMin,
+    estimateSource: est.estimateSource,
+    corroboration:  est.corroboration,
+    crosses:        { cx1: cx1.confirmed, cx2: cx2.converges, cx3, cx4 },
+    crossBonus,
+    p7Safe:         !p7r.blocking,
+    ai_log,
+  }
+}
+
+export function getRiskStreak(rounds) {
+  const today = getTodayRounds(rounds)
+  if (today.length < 10) return { streak: 0, historicalMax: 0, isRisk: false }
+  let streak = 0
+  for (let i = today.length - 1; i >= 0; i--) { if (today[i].color === 'white') break; streak++ }
+  let max = 0, cur = 0
+  for (const r of today) { if (r.color !== 'white') cur++; else { if (cur > max) max = cur; cur = 0 } }
+  if (cur > max) max = cur
+  return { streak, historicalMax: max, isRisk: streak >= Math.max(8, Math.floor(max * 0.8)) && streak >= 6 }
+}
+
+export function getStats(rounds, signals) {
+  const today  = getTodayRounds(rounds)
+  const whites = today.filter(r => r.color === 'white')
+  const byHour = {}
+  whites.forEach(r => { const h = brtHour(r.time); byHour[h] = (byHour[h] || 0) + 1 })
+  const hours  = Object.keys(byHour).length || 1
+  const counts = {}
+  for (let i = 1; i < today.length; i++) { if (today[i].color === 'white') { const p = today[i-1].num; counts[p] = (counts[p] || 0) + 1 } }
+  const top        = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]
+  const todayStr   = todayBRT()
+  const todaySigs  = signals.filter(s => brtDateStr(s.created_at) === todayStr)
+  const w = todaySigs.filter(s => s.status === 'win').length
+  const l = todaySigs.filter(s => s.status === 'loss').length
+  return {
+    total: today.length, whites: whites.length, avgPerHour: (whites.length / hours).toFixed(1),
+    topTrigger: top ? `${top[0]} (${top[1]}x)` : '-',
+    // Fix 12: usa MAX entre limite calculado por hoje e média histórica (mais estável)
+    stopWhites:  Math.max(getDynamicStopWhites(today), Math.ceil(getWhitesAvgPerHour(rounds) * 1.5)),
+    stopSignals: Math.max(getDynamicStopSignals(today), Math.ceil(getWhitesAvgPerHour(rounds) * 1.5) + 1),
+    wins: w, losses: l, rate: w + l > 0 ? Math.round(w / (w + l) * 100) : 0, totalSignals: signals.length,
+  }
+}
+
+export function getSigWindow(timeStr) {
+  const [h, m] = timeStr.split(':').map(Number)
+  const base   = new Date(); base.setHours(h, m, 0, 0)
+  return { startW: new Date(base.getTime() - 60000), endW: new Date(base.getTime() + 60000) }
+}
+
+function getDynamicStopWhites(today) {
+  const byH = {}
+  today.filter(r => r.color === 'white').forEach(r => { const h = brtHour(r.time); byH[h] = (byH[h] || 0) + 1 })
+  const v = Object.values(byH)
+  return v.length ? Math.max(4, Math.ceil(v.reduce((a, b) => a + b, 0) / v.length * 1.5)) : 8
+}
+function getDynamicStopSignals(today) { return Math.max(3, getDynamicStopWhites(today) + 1) }
+
+export function analyzeDebug(rounds, signals = []) {
+  const today = getTodayRounds(rounds)
+  if (today.length < 20) return null
+  const lastNum    = today.length ? today[today.length - 1].num : null
+  const p1         = pillar1(rounds)
+  const triggerHit = p1.numbers.find(x => x.num === lastNum)
+  const p1Active   = p1.valid && !!triggerHit
+  const p2r        = pillar2(p1.numbers, lastNum)
+  const p2Active   = p2r.valid
+  const p4r        = pillar4(rounds)
+  const p6r        = pillar6(rounds)
+  const p7r        = pillar7(rounds)
+  const nowMin     = toBRT(new Date()).getUTCMinutes()
+  const hotMap     = getHotMinutes(rounds)
+  const est        = estimateNextWhite(p1.numbers, lastNum, hotMap, nowMin)
+  const estimateMin = est.estimateMin
+  const targetMin   = (nowMin + estimateMin) % 60
+  const p5r         = pillar5(rounds, targetMin)
+  const p3r         = pillar3(p1Active, p2Active, hotMap, targetMin, p5r)
+  const cx1         = crossP1P6(est.currentProfile, p6r, hotMap, nowMin)
+  const cx2         = crossP2P4(p2r.mode, p4r)
+  const cx3         = p3r.crossBonus
+  const cx4         = crossTop5Corroboration(est.corroboration)
+  const cadence     = getCadenceQuota(rounds, signals)
+  const avg24h      = getWhiteAverage(rounds)
+
+  return {
+    totalRodadas: today.length, totalHistorico: rounds.length, lastNum,
+    p1: {
+      active: p1Active, desc: 'Top 5 Números Gatilho (±1min)',
+      detail: p1.valid
+        ? `Top 5: ${p1.numbers.map(x => `#${x.num}(moda:${x.mode}min,${x.consistency}%,n=${x.occurrences})`).join(', ')} | Último: #${lastNum} ${triggerHit ? 'MATCH' : 'sem match'}`
+        : `Sem números com pelo menos ${P1_MIN_OCCURRENCES} ocorrências`,
+    },
+    p2: {
+      active: p2Active, desc: 'Intervalo Consistente (top-3 do P1, variação ≤2min)',
+      detail: p2r.valid
+        ? `Gatilho #${lastNum} ativou P2 (top-3: ${p2r.top3?.map(x=>`#${x.num}`).join(',')}) | Moda: ${p2r.mode}min | Consistência: ${p2r.consistency}%`
+        : `#${lastNum ?? '-'} não está no top-3 do P1 ou tem variação irregular | Top-3: ${p2r.top3?.map(x=>`#${x.num}(${x.consistency}%)`).join(', ') || '-'}`,
+    },
+    p3: {
+      active: p3r.valid, desc: 'Minuto Quente (±2min, cadeia P1+P2)',
+      detail: !p1Active || !p2Active
+        ? `Bloqueado: P1 ${p1Active ? 'ok' : 'inativo'} P2 ${p2Active ? 'ok' : 'inativo'}`
+        : hotMap.hot.length
+          ? `Quentes: ${hotMap.hot.slice(0,5).map(x => `${String(x.min).padStart(2,'0')}m(${x.count}x)`).join(', ')} | Alvo: ${String(targetMin).padStart(2,'0')}min ${p3r.valid ? 'OK' : 'frio'} ${p3r.crossBonus ? '| +bonus P3xP5' : ''}`
+          : 'Sem minutos quentes ainda',
+    },
+    p4: {
+      active: p4r.detected, desc: 'Ritmo Preditivo de Contexto',
+      detail: p4r.detected ? `Padrão detectado! Similaridade ${p4r.similarity}% | Gap ${p4r.gap}min` : 'Sem padrão similar (min 75%)',
+    },
+    p5: {
+      active: p5r.detected, desc: 'Confirmação Histórica no Minuto Alvo',
+      detail: p5r.detected
+        ? `4/11/0 confirmado: ${p5r.confirmed}/${p5r.total} brancos no alvo (${p5r.rate}%) | +${p5r.boost}% confiança`
+        : `Sem confirmação (${p5r.confirmed || 0}/${p5r.total || 0})`,
+    },
+    p6: {
+      active: p6r.detected, desc: 'Sequência 8 Cores (pilar obrigatório)',
+      detail: p6r.detected
+        ? `[${p6r.currentSeq}] bate ${p6r.matchScore}% com [${p6r.matchedSeq}] (${p6r.matchPct}% dos brancos)`
+        : `[${p6r.currentSeq || '???'}] sem padrão forte | Melhor: ${p6r.sequences[0] ? `[${p6r.sequences[0].seq}] ${p6r.sequences[0].pct}%` : 'N/A'}`,
+    },
+    p7: {
+      active: !p7r.blocking, desc: 'Zona Morta / Falso Branco',
+      blocking: p7r.blocking,
+      detail: p7r.detail,
+      similarity: p7r.similarity,
+      falseWhiteCount: p7r.falseWhiteCount,
+      patterns: p7r.patterns,
+    },
+    crosses: {
+      cx1: { active: cx1.confirmed, desc: 'P1 x P6 — Gatilho + Sequência de Cores', detail: cx1.confirmed ? `Gatilho #${lastNum} e sequência de cores convergem (+${cx1.bonus}% confiança)` : 'Sem convergência' },
+      cx2: { active: cx2.converges, desc: 'P2 x P4 — Moda do Gatilho converge com Gap do Ritmo', detail: cx2.converges ? `Moda P2 (${p2r.mode}min) e gap P4 (${p4r.gap}min) convergem (+${cx2.bonus}% confiança)` : `Sem convergência: moda ${p2r.mode}min vs gap ${p4r.gap || 0}min` },
+      cx3: { active: cx3, desc: 'P3 x P5 — Minuto Quente + Confirmação Histórica', detail: cx3 ? `Mesmo minuto confirmado por P3 e P5 (+8% confiança)` : 'P3 e P5 não confirmam o mesmo minuto' },
+      cx4: { active: cx4, desc: 'Top5 Corroboração — 2+ gatilhos apontam o mesmo intervalo', detail: cx4 ? `${est.corroboration} outro(s) gatilho(s) do Top5 confirmam (+5% confiança)` : 'Nenhum outro gatilho confirma o intervalo' },
+    },
+    targetMin, estimateMin, estimateSource: est.estimateSource, corroboration: est.corroboration,
+    triggerProfiles: est.profiles, hotMap, cadence, avg24h,
+  }
+}
+
+export function getHourlyQuota(rounds, signals) { return getCadenceQuota(rounds, signals) }

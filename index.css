@@ -1,0 +1,118 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { supabase } from '../lib/supabase'
+
+export function getColor(num) {
+  if (num === 0) return 'white'
+  if (num >= 1 && num <= 7) return 'red'
+  return 'black'
+}
+
+export default function useRounds() {
+  const [rounds,     setRounds]  = useState([])
+  const [online,     setOnline]  = useState(false)
+  const [error,      setError]   = useState(null)
+  const seenIdsRef               = useRef(new Set())
+  const timerRef                 = useRef(null)
+  const failCountRef             = useRef(0)
+
+  const saveToDb = useCallback(async (newRounds) => {
+    if (!newRounds.length) return
+    const rows = newRounds.map(r => ({
+      blaze_id:   String(r.id),
+      roll:       r.num,
+      color:      r.color,
+      created_at: r.time,
+    }))
+    await supabase.from('rounds').upsert(rows, { onConflict: 'blaze_id', ignoreDuplicates: true })
+  }, [])
+
+  const mergeRounds = useCallback((incoming) => {
+    if (!incoming || incoming.length === 0) return false
+    const novo = incoming.filter(r => !seenIdsRef.current.has(String(r.id)))
+    if (novo.length === 0) return false
+    novo.forEach(r => seenIdsRef.current.add(String(r.id)))
+    setRounds(prev => [...prev, ...novo].sort((a, b) => new Date(a.time) - new Date(b.time)))
+    saveToDb(novo)
+    return true
+  }, [saveToDb])
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const { data } = await supabase
+        .from('rounds')
+        .select('*')
+        .order('created_at', { ascending: true })
+        .limit(5000)
+      if (data && data.length > 0) {
+        const mapped = data.map(r => ({
+          id:          String(r.blaze_id),
+          num:         r.roll,
+          color:       r.color,
+          time:        r.created_at,
+          display:     fmtBRT(r.created_at, false),
+          displayFull: fmtBRT(r.created_at, true),
+        }))
+        mapped.forEach(r => seenIdsRef.current.add(r.id))
+        setRounds(mapped)
+        setOnline(true)
+      }
+    } catch (_) {}
+  }, [])
+
+  const fetchFromEdge = useCallback(async () => {
+    try {
+      const { data, error: fnErr } = await supabase.functions.invoke('get-rounds')
+      if (fnErr || !data?.ok || !Array.isArray(data.rounds) || data.rounds.length === 0) return false
+      mergeRounds(data.rounds)
+      failCountRef.current = 0
+      setError(null)
+      setOnline(true)
+      return true
+    } catch (_) { return false }
+  }, [mergeRounds])
+
+  const fetchFromApi = useCallback(async () => {
+    try {
+      const res = await fetch('/api/rounds')
+      if (!res.ok) return false
+      const data = await res.json()
+      if (!data.ok || !Array.isArray(data.rounds) || data.rounds.length === 0) return false
+      mergeRounds(data.rounds)
+      failCountRef.current = 0
+      setError(null)
+      setOnline(true)
+      return true
+    } catch (_) { return false }
+  }, [mergeRounds])
+
+  const fetchRounds = useCallback(async () => {
+    const ok = await fetchFromEdge()
+    if (!ok) {
+      const ok2 = await fetchFromApi()
+      if (!ok2) {
+        failCountRef.current++
+        if (failCountRef.current >= 3) {
+          setOnline(false)
+          setError('Sem conexao com a fonte de dados')
+        }
+      }
+    }
+  }, [fetchFromEdge, fetchFromApi])
+
+  useEffect(() => {
+    loadHistory().then(() => fetchRounds())
+    timerRef.current = setInterval(fetchRounds, 8000)
+    return () => clearInterval(timerRef.current)
+  }, [loadHistory, fetchRounds])
+
+  return { rounds, online, error, refetch: fetchRounds }
+}
+
+function fmtBRT(isoStr, withSeconds) {
+  const d   = new Date(isoStr)
+  const brt = new Date(d.getTime() - 3 * 60 * 60 * 1000)
+  const h   = String(brt.getUTCHours()).padStart(2, '0')
+  const m   = String(brt.getUTCMinutes()).padStart(2, '0')
+  const s   = String(brt.getUTCSeconds()).padStart(2, '0')
+  return withSeconds ? `${h}:${m}:${s}` : `${h}:${m}`
+}
